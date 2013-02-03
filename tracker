@@ -1,0 +1,119 @@
+#!/usr/bin/python2 -u
+import select
+import dbus
+import gobject
+import os
+import sys
+import signal
+import re
+import threading
+import time
+from select import select
+from dbus.mainloop.glib import DBusGMainLoop
+
+# TODO
+# Use ps --format=cmd= <PID> to add cmd line to logs
+
+current_window = {'id': None, 'class': None, 'name': None, 'changed': False}
+current_window_data_stream = None
+current_window_data_pid = None
+current_window_thread = None
+screensaver_enabled = None
+print_lock = threading.Lock()
+
+def handle_screensaver_signal(value):
+  global screensaver_enabled, current_window
+  if screensaver_enabled != value:
+    screensaver_enabled = value
+    print_status()
+
+def check_if_window_changed(stream):
+  global current_window, screensaver_enabled
+  while True:
+    line = stream.readline().rstrip()
+    if not line:
+      continue
+    window_id = line.rstrip().split()[-1]
+    if current_window['id'] != window_id:
+      current_window = {'id': window_id, 'class': None, 'name': None,
+                            'changed': False}
+      start_watching_window(window_id)
+
+def start_watching_window(window_id):
+  global current_window_data_stream, current_window_data_pid
+  if current_window_data_pid:
+    try:
+      os.kill(current_window_data_pid, signal.SIGHUP)
+    except OSError:
+      pass
+  if current_window_data_stream:
+    current_window_data_stream = None
+  if window_id != '0x0':
+    (pid, _, stdout, _) = gobject.spawn_async(
+        ['/usr/bin/xprop', '-spy', '-notype', '-id', window_id, 'WM_NAME', 'WM_CLASS'],
+        standard_output = True)
+    current_window_data_pid = pid
+    current_window_data_stream = os.fdopen(stdout)
+
+def check_for_window_data():
+  global current_window_data_stream, current_window, screensaver_enabled
+  while True:
+    try:
+      while True:
+        if not current_window_data_stream:
+          break
+        line = current_window_data_stream.readline()
+        match = re.match(r'WM_(CLASS|NAME) = "(.*)"$', line.rstrip())
+        if match:
+          name, value = match.groups()
+          name = name.lower()
+          if name == 'class':
+            value = value.split('", "')[0]
+          if current_window[name] != value:
+            current_window[name] = value
+            current_window['changed'] = True
+            if not screensaver_enabled:
+              print_status()
+    except IOError:
+      pass
+    time.sleep(0.1)
+
+def timestamp():
+  return time.strftime("%Y-%m-%d %H:%M:%S")
+
+def print_status():
+  global screensaver_enabled, current_window, print_lock
+  print_lock.acquire()
+  if screensaver_enabled:
+    print "%s\tscreensaver\tscreensaver\tScreensaver" % timestamp()
+  elif current_window['name'] and current_window['class']:
+    print "%s\t%s\t%s\t%s" % (timestamp(), current_window['id'], current_window['class'], current_window['name'])
+  print_lock.release()
+
+def main():
+  gobject.threads_init()
+  DBusGMainLoop(set_as_default = True)
+  session_bus = dbus.SessionBus()
+  screen_saver = session_bus.get_object('org.freedesktop.ScreenSaver', '/ScreenSaver')
+  screen_saver.connect_to_signal('ActiveChanged', handle_screensaver_signal)
+  is_screensaver_active = screen_saver.get_dbus_method('GetActive')
+  handle_screensaver_signal(is_screensaver_active())
+  (pid, _, stdout, _) = gobject.spawn_async(['/usr/bin/xprop', '-spy', '-root',
+                                           '_NET_ACTIVE_WINDOW'], standard_output = True)
+  window_watcher = threading.Thread(target =check_if_window_changed,
+                                  args=[os.fdopen(stdout)])
+  window_watcher.daemon = True
+  window_watcher.start()
+  data_watcher = threading.Thread(target = check_for_window_data)
+  data_watcher.daemon = True
+  data_watcher.start()
+  loop = gobject.MainLoop()
+  try:
+    loop.run()
+  except KeyboardInterrupt:
+    print_lock.acquire()
+    print "%s\texit\texit\texit" % timestamp()
+    sys.exit(0)
+
+if __name__ == "__main__":
+  main()
